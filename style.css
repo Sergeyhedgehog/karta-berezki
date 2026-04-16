@@ -250,6 +250,8 @@ html, body {
     overflow: hidden;
     background: var(--ocean);
     touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
 }
 .map-container svg {
     position: absolute;
@@ -257,11 +259,13 @@ html, body {
     left: 0;
     width: 100%;
     height: 100%;
+    display: block;
 }
 .map-container svg .country {
     fill: var(--country-default);
     stroke: var(--country-stroke);
-    stroke-width: 0.5;
+    stroke-width: 0.4;
+    vector-effect: non-scaling-stroke;
     cursor: pointer;
     transition: fill 0.15s;
 }
@@ -270,6 +274,7 @@ html, body {
 }
 .map-container svg .country.visited {
     fill: var(--country-visited);
+    filter: drop-shadow(0 0 2px rgba(76, 175, 80, 0.4));
 }
 .map-container svg .country.visited:hover {
     fill: var(--green-bright);

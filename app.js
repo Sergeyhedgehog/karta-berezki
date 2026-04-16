@@ -130,10 +130,22 @@ function setupAuth() {
     authUsername.addEventListener('keydown', function(e) { if (e.key === 'Enter') authPassword.focus(); });
 }
 
+function findUserByEmail(email) {
+    return db.ref('users').orderByChild('email').equalTo(email.toLowerCase().trim()).once('value').then(function(s) {
+        var result = null;
+        s.forEach(function(child) {
+            var data = child.val();
+            if (data.emailVerified) result = data;
+        });
+        return result;
+    });
+}
+
 function handleAuth() {
     if (!db) { authError.textContent = 'Нет подключения к серверу'; return; }
     var input = authUsername.value.trim();
     var password = authPassword.value.trim();
+    var isEmail = input.indexOf('@') > 0;
 
     if (authMode === 'register') {
         var username = sanitize(input);
@@ -156,20 +168,34 @@ function handleAuth() {
             });
         });
     } else {
-        if (!input) { authError.textContent = 'Введите логин'; return; }
+        if (!input) { authError.textContent = 'Введите логин или email'; return; }
         if (!password || password.length < 4) { authError.textContent = 'Пароль — минимум 4 символа'; return; }
-        var username = sanitize(input);
-        var key = fbKey(username);
-        sha256('berezka-pass-' + password).then(function(passHash) {
-            db.ref('users/' + key).once('value').then(function(s) {
-                if (!s.exists()) { authError.textContent = 'Пользователь не найден'; return; }
-                if (s.val().passHash !== passHash) { authError.textContent = 'Неверный пароль'; return; }
-                localStorage.setItem('berezka_map_user', username);
-                myUsername = username;
-                myKey = key;
-                startApp();
+
+        if (isEmail) {
+            findUserByEmail(input).then(function(userData) {
+                if (!userData) { authError.textContent = 'Пользователь с таким email не найден'; return; }
+                sha256('berezka-pass-' + password).then(function(passHash) {
+                    if (userData.passHash !== passHash) { authError.textContent = 'Неверный пароль'; return; }
+                    localStorage.setItem('berezka_map_user', userData.username);
+                    myUsername = userData.username;
+                    myKey = fbKey(sanitize(userData.username));
+                    startApp();
+                });
             }).catch(function(e) { authError.textContent = e.message; });
-        });
+        } else {
+            var username = sanitize(input);
+            var key = fbKey(username);
+            sha256('berezka-pass-' + password).then(function(passHash) {
+                db.ref('users/' + key).once('value').then(function(s) {
+                    if (!s.exists()) { authError.textContent = 'Пользователь не найден'; return; }
+                    if (s.val().passHash !== passHash) { authError.textContent = 'Неверный пароль'; return; }
+                    localStorage.setItem('berezka_map_user', username);
+                    myUsername = username;
+                    myKey = key;
+                    startApp();
+                }).catch(function(e) { authError.textContent = e.message; });
+            });
+        }
     }
 }
 
@@ -195,8 +221,9 @@ function loadWorldMap(container, onCountryClick) {
         .then(function(topo) {
             var geojson = topojson.feature(topo, topo.objects.countries);
             var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            svg.setAttribute('viewBox', '-20 -10 960 500');
-            svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+            svg.setAttribute('viewBox', '0 20 920 420');
+            // 'slice' fills container; actual visible area controlled by viewBox in setupMapInteraction
+            svg.setAttribute('preserveAspectRatio', 'xMidYMid slice');
 
             var g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
             svg.appendChild(g);
@@ -214,14 +241,7 @@ function loadWorldMap(container, onCountryClick) {
                 path.classList.add('country');
                 g.appendChild(path);
 
-                if (onCountryClick) {
-                    path.addEventListener('click', function(e) {
-                        e.stopPropagation();
-                        onCountryClick(alpha2, path);
-                    });
-                }
-
-                // Tooltip
+                // Tooltip on hover (desktop)
                 path.addEventListener('mouseenter', function() {
                     var name = COUNTRY_NAMES[alpha2];
                     if (name && countryTooltip) countryTooltip.textContent = name;
@@ -233,6 +253,12 @@ function loadWorldMap(container, onCountryClick) {
 
             container.innerHTML = '';
             container.appendChild(svg);
+
+            // Delegate clicks via container-level tap detection (handled in setupMapInteraction)
+            if (onCountryClick) {
+                svg._onCountryTap = onCountryClick;
+            }
+
             return { svg: svg, g: g };
         });
 }
@@ -276,79 +302,112 @@ function geoToPath(geom) {
 }
 
 // ============================================================
-// MAP INTERACTION (Pan/Zoom)
+// MAP INTERACTION (Pan/Zoom + Tap)
 // ============================================================
-function setupMapInteraction(container, svg) {
-    var vb = { x: -20, y: -10, w: 960, h: 500 };
+function setupMapInteraction(container, svg, zoomInBtnId, zoomOutBtnId) {
+    var BASE_W = 920, BASE_H = 420;
+    // Compute initial viewBox based on container aspect ratio
+    var rect0 = container.getBoundingClientRect();
+    var contAspect = rect0.width / rect0.height; // container width/height
+    var mapAspect = BASE_W / BASE_H;
+    var vb;
+    if (contAspect >= mapAspect) {
+        // Wide container — show whole map with some space
+        vb = { x: 0, y: 20, w: BASE_W, h: BASE_W / contAspect };
+        vb.y = 20 + (BASE_H - vb.h) / 2;
+    } else {
+        // Tall container — crop sides so map fills height
+        vb = { x: 0, y: 20, w: BASE_H * contAspect, h: BASE_H };
+        // Center horizontally on main landmasses (shift right to hide some Pacific)
+        vb.x = (BASE_W - vb.w) / 2;
+    }
     var startVb = {};
     var pointers = {};
+    var startPointers = {};
     var moved = false;
+    var pointerDownTime = 0;
+    var pinchStartDist = 0;
 
     function setVB() {
         svg.setAttribute('viewBox', vb.x + ' ' + vb.y + ' ' + vb.w + ' ' + vb.h);
     }
+    setVB();
 
     function clampVB() {
-        var minW = 100, maxW = 1200;
+        var minW = 80, maxW = 1400;
         vb.w = Math.max(minW, Math.min(maxW, vb.w));
-        vb.h = vb.w * (500 / 960);
-        vb.x = Math.max(-200, Math.min(960 - vb.w + 200, vb.x));
-        vb.y = Math.max(-100, Math.min(500 - vb.h + 100, vb.y));
+        vb.h = vb.w * (BASE_H / BASE_W);
+        vb.x = Math.max(-300, Math.min(BASE_W - vb.w + 300, vb.x));
+        vb.y = Math.max(-100, Math.min(BASE_H - vb.h + 120, vb.y));
     }
 
-    // Mouse wheel zoom
-    container.addEventListener('wheel', function(e) {
-        e.preventDefault();
+    function zoomAt(factor, clientX, clientY) {
         var rect = container.getBoundingClientRect();
-        var mx = (e.clientX - rect.left) / rect.width;
-        var my = (e.clientY - rect.top) / rect.height;
-        var factor = e.deltaY > 0 ? 1.15 : 0.87;
+        var mx = (clientX - rect.left) / rect.width;
+        var my = (clientY - rect.top) / rect.height;
         var newW = vb.w * factor;
-        var newH = newW * (500 / 960);
+        var newH = newW * (BASE_H / BASE_W);
         vb.x += (vb.w - newW) * mx;
         vb.y += (vb.h - newH) * my;
         vb.w = newW;
         vb.h = newH;
         clampVB();
         setVB();
+    }
+
+    // Mouse wheel zoom
+    container.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        var factor = e.deltaY > 0 ? 1.2 : 0.83;
+        zoomAt(factor, e.clientX, e.clientY);
     }, { passive: false });
 
-    // Touch/mouse drag
     container.addEventListener('pointerdown', function(e) {
         pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
-        startVb = { x: vb.x, y: vb.y, w: vb.w, h: vb.h };
-        moved = false;
-        container.setPointerCapture(e.pointerId);
+        startPointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+        var ids = Object.keys(pointers);
+        if (ids.length === 1) {
+            startVb = { x: vb.x, y: vb.y, w: vb.w, h: vb.h };
+            moved = false;
+            pointerDownTime = Date.now();
+        } else if (ids.length === 2) {
+            startVb = { x: vb.x, y: vb.y, w: vb.w, h: vb.h };
+            var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
+            pinchStartDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+            moved = true;
+        }
+        try { container.setPointerCapture(e.pointerId); } catch(err) {}
     });
 
     container.addEventListener('pointermove', function(e) {
         if (!pointers[e.pointerId]) return;
+        pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
         var ids = Object.keys(pointers);
 
         if (ids.length === 1) {
-            // Pan
-            var dx = e.clientX - pointers[e.pointerId].x;
-            var dy = e.clientY - pointers[e.pointerId].y;
-            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
-            var rect = container.getBoundingClientRect();
-            var scaleX = vb.w / rect.width;
-            var scaleY = vb.h / rect.height;
-            vb.x = startVb.x - dx * scaleX;
-            vb.y = startVb.y - dy * scaleY;
-            clampVB();
-            setVB();
+            var start = startPointers[e.pointerId];
+            var dx = e.clientX - start.x;
+            var dy = e.clientY - start.y;
+            if (!moved && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) moved = true;
+            if (moved) {
+                var rect = container.getBoundingClientRect();
+                var scaleX = startVb.w / rect.width;
+                var scaleY = startVb.h / rect.height;
+                vb.x = startVb.x - dx * scaleX;
+                vb.y = startVb.y - dy * scaleY;
+                clampVB();
+                setVB();
+            }
         } else if (ids.length === 2) {
-            // Pinch zoom
-            pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
             var p1 = pointers[ids[0]], p2 = pointers[ids[1]];
             var dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-            if (pinchDist > 0) {
-                var factor = pinchDist / dist;
+            if (pinchStartDist > 0) {
+                var factor = pinchStartDist / dist;
                 var rect = container.getBoundingClientRect();
                 var mx = ((p1.x + p2.x) / 2 - rect.left) / rect.width;
                 var my = ((p1.y + p2.y) / 2 - rect.top) / rect.height;
                 var newW = startVb.w * factor;
-                var newH = newW * (500 / 960);
+                var newH = newW * (BASE_H / BASE_W);
                 vb.x = startVb.x + (startVb.w - newW) * mx;
                 vb.y = startVb.y + (startVb.h - newH) * my;
                 vb.w = newW;
@@ -356,54 +415,54 @@ function setupMapInteraction(container, svg) {
                 clampVB();
                 setVB();
             }
-            pinchDist = dist;
             moved = true;
         }
     });
 
-    container.addEventListener('pointerup', function(e) {
+    function handlePointerEnd(e) {
+        if (!pointers[e.pointerId]) return;
+        var wasIds = Object.keys(pointers).length;
+        var start = startPointers[e.pointerId];
         delete pointers[e.pointerId];
-        if (Object.keys(pointers).length === 0) pinchDist = 0;
-    });
+        delete startPointers[e.pointerId];
 
-    container.addEventListener('pointercancel', function(e) {
-        delete pointers[e.pointerId];
-        if (Object.keys(pointers).length === 0) pinchDist = 0;
-    });
+        if (Object.keys(pointers).length === 0) pinchStartDist = 0;
 
-    // Prevent country clicks if dragged
-    svg.addEventListener('click', function(e) {
-        if (moved) { e.stopPropagation(); moved = false; }
-    }, true);
+        // Tap detection: single pointer, minimal movement, short duration
+        if (wasIds === 1 && !moved && start && Date.now() - pointerDownTime < 500) {
+            var dx = e.clientX - start.x;
+            var dy = e.clientY - start.y;
+            if (Math.abs(dx) < 8 && Math.abs(dy) < 8) {
+                // It's a tap — find country at this point
+                var el = document.elementFromPoint(e.clientX, e.clientY);
+                if (el && el.classList && el.classList.contains('country') && svg._onCountryTap) {
+                    var code = el.dataset.code;
+                    svg._onCountryTap(code, el);
+                }
+            }
+        }
+    }
+
+    container.addEventListener('pointerup', handlePointerEnd);
+    container.addEventListener('pointercancel', handlePointerEnd);
 
     // Zoom buttons
-    $('zoom-in').addEventListener('click', function() {
-        var factor = 0.75;
-        var newW = vb.w * factor;
-        var newH = newW * (500 / 960);
-        vb.x += (vb.w - newW) * 0.5;
-        vb.y += (vb.h - newH) * 0.5;
-        vb.w = newW;
-        vb.h = newH;
-        clampVB();
-        setVB();
-    });
-    $('zoom-out').addEventListener('click', function() {
-        var factor = 1.33;
-        var newW = vb.w * factor;
-        var newH = newW * (500 / 960);
-        vb.x += (vb.w - newW) * 0.5;
-        vb.y += (vb.h - newH) * 0.5;
-        vb.w = newW;
-        vb.h = newH;
-        clampVB();
-        setVB();
-    });
+    if (zoomInBtnId) {
+        var zi = $(zoomInBtnId);
+        if (zi) zi.addEventListener('click', function() {
+            var rect = container.getBoundingClientRect();
+            zoomAt(0.7, rect.left + rect.width/2, rect.top + rect.height/2);
+        });
+    }
+    if (zoomOutBtnId) {
+        var zo = $(zoomOutBtnId);
+        if (zo) zo.addEventListener('click', function() {
+            var rect = container.getBoundingClientRect();
+            zoomAt(1.4, rect.left + rect.width/2, rect.top + rect.height/2);
+        });
+    }
 
-    return {
-        getVB: function() { return vb; },
-        getMoved: function() { return moved; }
-    };
+    return { getVB: function() { return vb; } };
 }
 
 // ============================================================
@@ -416,7 +475,7 @@ function loadMyMap() {
     }).then(function(result) {
         mapSvg = result.svg;
         mapGroup = result.g;
-        setupMapInteraction(container, mapSvg);
+        setupMapInteraction(container, mapSvg, 'zoom-in', 'zoom-out');
         loadVisitedCountries();
     });
 }
@@ -438,16 +497,14 @@ function renderVisited() {
 }
 
 function toggleCountry(code, pathEl) {
-    if (visitedCountries[code]) {
-        delete visitedCountries[code];
+    var isVisited = !!visitedCountries[code];
+    // Firebase .on callback will update visitedCountries, DOM, and counter
+    if (isVisited) {
         db.ref('travel_maps/' + myKey + '/countries/' + code).remove();
     } else {
-        visitedCountries[code] = true;
         db.ref('travel_maps/' + myKey + '/countries/' + code).set(true);
     }
-    pathEl.classList.toggle('visited');
-    updateCounter();
-    // Save username reference
+    // Save username reference (for search)
     db.ref('travel_maps/' + myKey + '/username').set(myUsername);
 }
 
@@ -492,21 +549,15 @@ function handleCountryListClick(e) {
     var item = e.target.closest('.modal-list-item');
     if (!item) return;
     var code = item.dataset.code;
-    var pathEl = mapSvg ? mapSvg.querySelector('[data-code="' + code + '"]') : null;
-
+    // Firebase .on callback will update visitedCountries, DOM, and counter
     if (visitedCountries[code]) {
-        delete visitedCountries[code];
         db.ref('travel_maps/' + myKey + '/countries/' + code).remove();
         item.classList.remove('checked');
-        if (pathEl) pathEl.classList.remove('visited');
     } else {
-        visitedCountries[code] = true;
         db.ref('travel_maps/' + myKey + '/countries/' + code).set(true);
         item.classList.add('checked');
-        if (pathEl) pathEl.classList.add('visited');
     }
     db.ref('travel_maps/' + myKey + '/username').set(myUsername);
-    updateCounter();
 }
 
 // ============================================================
@@ -567,7 +618,7 @@ function viewUserMap(key, displayName) {
                 var p = result.svg.querySelector('[data-code="' + code + '"]');
                 if (p) p.classList.add('other-visited');
             });
-            setupMapInteraction(viewMapContainer, result.svg);
+            setupMapInteraction(viewMapContainer, result.svg, null, null);
         });
     });
 }
