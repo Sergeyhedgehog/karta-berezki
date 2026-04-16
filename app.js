@@ -78,16 +78,94 @@ function initDom() {
 // UTILITIES
 // ============================================================
 function sha256(text) {
-    if (window.crypto && window.crypto.subtle) {
-        return crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)).then(function(h) {
-            var b = new Uint8Array(h), hex = '';
-            for (var i = 0; i < b.length; i++) hex += b[i].toString(16).padStart(2, '0');
-            return hex;
-        });
+    // Prefer Web Crypto (fast, native), but always produce true SHA-256 hex so
+    // the hash matches what the messenger produced via crypto.subtle.
+    // Works in any context: HTTPS, HTTP (non-secure), file://, older browsers.
+    if (window.crypto && window.crypto.subtle && window.isSecureContext !== false) {
+        try {
+            var p = crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+            if (p && typeof p.then === 'function') {
+                return p.then(function(h) {
+                    var b = new Uint8Array(h), hex = '';
+                    for (var i = 0; i < b.length; i++) hex += b[i].toString(16).padStart(2, '0');
+                    return hex;
+                }).catch(function() { return Promise.resolve(sha256Pure(text)); });
+            }
+        } catch (e) { /* fall through to pure-JS */ }
     }
-    var hash = 0;
-    for (var i = 0; i < text.length; i++) { hash = ((hash << 5) - hash) + text.charCodeAt(i); hash &= hash; }
-    return Promise.resolve(Math.abs(hash).toString(16).padStart(12, '0'));
+    return Promise.resolve(sha256Pure(text));
+}
+
+// Pure-JS SHA-256 (RFC 6234). Produces the same 64-hex digest as crypto.subtle.
+function sha256Pure(ascii) {
+    function rrot(n, x) { return (x >>> n) | (x << (32 - n)); }
+    var mathPow = Math.pow;
+    var maxWord = mathPow(2, 32);
+    var result = '';
+
+    var words = [];
+    var asciiBitLength;
+
+    // UTF-8 encode
+    var utf8 = unescape(encodeURIComponent(ascii));
+    asciiBitLength = utf8.length * 8;
+
+    var hash = sha256Pure.h = sha256Pure.h || [];
+    var k = sha256Pure.k = sha256Pure.k || [];
+    var primeCounter = k.length;
+
+    var isComposite = {};
+    for (var candidate = 2; primeCounter < 64; candidate++) {
+        if (!isComposite[candidate]) {
+            for (var i = 0; i < 313; i += candidate) isComposite[i] = candidate;
+            hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
+            k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+        }
+    }
+    hash = hash.slice(0, 8);
+
+    utf8 += '\x80';
+    while (utf8.length % 64 - 56) utf8 += '\x00';
+    for (var i2 = 0; i2 < utf8.length; i2++) {
+        var j = utf8.charCodeAt(i2);
+        if (j >> 8) return '';
+        words[i2 >> 2] |= j << ((3 - i2) % 4) * 8;
+    }
+    words[words.length] = ((asciiBitLength / maxWord) | 0);
+    words[words.length] = (asciiBitLength);
+
+    for (var b = 0; b < words.length;) {
+        var w = words.slice(b, b += 16);
+        var oldHash = hash;
+        hash = hash.slice(0, 8);
+        for (var ii = 0; ii < 64; ii++) {
+            var w15 = w[ii - 15], w2 = w[ii - 2];
+            var a = hash[0], e = hash[4];
+            var temp1 = hash[7]
+                + (rrot(6, e) ^ rrot(11, e) ^ rrot(25, e))
+                + ((e & hash[5]) ^ ((~e) & hash[6]))
+                + k[ii]
+                + (w[ii] = (ii < 16) ? w[ii] : (
+                    w[ii - 16]
+                    + (rrot(7, w15) ^ rrot(18, w15) ^ (w15 >>> 3))
+                    + w[ii - 7]
+                    + (rrot(17, w2) ^ rrot(19, w2) ^ (w2 >>> 10))
+                  ) | 0
+                );
+            var temp2 = (rrot(2, a) ^ rrot(13, a) ^ rrot(22, a))
+                + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+            hash = [(temp1 + temp2) | 0].concat(hash);
+            hash[4] = (hash[4] + temp1) | 0;
+        }
+        for (var iii = 0; iii < 8; iii++) hash[iii] = (hash[iii] + oldHash[iii]) | 0;
+    }
+    for (var iv = 0; iv < 8; iv++) {
+        for (var jj = 3; jj + 1; jj--) {
+            var bv = (hash[iv] >> (jj * 8)) & 255;
+            result += ((bv < 16) ? '0' : '') + bv.toString(16);
+        }
+    }
+    return result;
 }
 
 function sanitize(n) { return n.trim().toLowerCase().replace(/[^a-z\u0430-\u044f\u04510-9_-]/gi, ''); }
